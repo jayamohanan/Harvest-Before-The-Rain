@@ -1,4 +1,4 @@
-// Piggy's Harvest — main game scene
+// Harvest Before Rain — main game scene
 // No physics engine — pure drag/drop merge, with the farm half showing the crop
 
 // AN ITEM'S ART CAN RUN PAST ITS PIG. The pig face is the top-left
