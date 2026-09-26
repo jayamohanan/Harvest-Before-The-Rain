@@ -590,7 +590,7 @@ var CONFIG = {
         // the sum beside it and with every other readout. White on dark, like
         // the rest.
         SLOT_RATE: {
-            COLOR:    '#000000',
+            COLOR:    '#8a3b1c',   // the same rust as the "-20" off a plant's figure (CROPS.YIELD_LABEL.DELTA.COLOR)
             STROKE:   '#ffffff',
             STROKE_W: 0,           // no outline
         },
@@ -1295,23 +1295,10 @@ var CONFIG = {
             // the whole thing on a tween.
             EXPLODE: {
                 ENABLED: true,
-                // THE TENSION. A squeeze-and-swell, tighter each time, so it
-                // reads as building rather than as one pulse repeated — WIND_UP
-                // is how many extra cycles it takes past the first before it
-                // goes. Position wobbles a couple of px in time with it: a bank
-                // under strain trembles, it does not glide.
-                //
-                // HALVED FROM THE FIRST PASS (was 0.90 / 1.12 / 3px): at the
-                // full swing it read as bobbing in place rather than straining
-                // — closer to floating than to something about to go.
-                SQUEEZE: 0.95,     // scale at the bottom of a squeeze
-                SWELL:   1.06,     // scale at the top, just before it goes
-                CYCLE_MS: 110,     // one squeeze-to-swell, one way
-                WIND_UP:  2,       // extra cycles before the final one bursts
-                JITTER:   1.5,     // px @ design, the trembling
-                // THE BURST. Past SWELL, one fast lunge further out while it
-                // fades — an explosion overshoots outward, it does not shrink
-                // to nothing — and then it is simply gone: hidden, not
+                // THE BURST — at once, no wind-up: the moment the fruit it was
+                // waiting on lands. One fast lunge outward while it fades — an
+                // explosion overshoots outward, it does not shrink to nothing —
+                // and then it is simply gone: hidden, not
                 // destroyed, so the same sprite is there, at rest, the next time
                 // this plot grows a plant worth bursting for.
                 BURST_SCALE: 1.275,   // halved from 1.55 (extra scale 0.55 → 0.275)
@@ -1411,25 +1398,69 @@ var CONFIG = {
     },
 
     // ── THE RAIN TIMER ────────────────────────────────────────────────────────
-    // A stopwatch and a countdown, centred under the middle bank. It starts
-    // with the game; when it reaches nought the rain begins. For now that is
-    // all it does — nothing is reset and no crop is touched.
+    // A long bar across the farm half, just under the banks, filling left to
+    // right toward a rain cloud at its right end. When it is full the rain
+    // comes (see RAIN_ROUND). Smooth, not in one-second steps, and held while
+    // the field is finished and the level is turning over.
     //
-    // The stopwatch is drawn in code (see _timerIconTexture), so there is no
-    // file to supply.
+    // The cloud is drawn in code (see _rainIconTexture), so there is no file
+    // to supply.
     RAIN_TIMER: {
         ENABLED: true,
         SECONDS: 15,
-        SIZE:    34,        // the figure's type, px @ design scale
-        ICON_FRAC: 1.15,    // the stopwatch's height, × SIZE
-        ICON_GAP:  6,       // stopwatch → figure (px @ design)
-        GAP:       8,       // the banks' floor → the timer's top (px @ design)
-        COLOR:        '#ffffff',
-        STROKE:       '#5a3d1e',
-        STROKE_W:     5,
-        // Under the fruit flying up to the middle bank (CROPS.DEPTH.PICKED = 6),
-        // so produce passes over the timer rather than behind it.
+        HEIGHT:    16,      // the bar's thickness, px @ design scale
+        SIDE_PAD:  28,      // off the half's left edge, and the cloud's right
+                            // edge off its right one (px @ design)
+        GAP:       10,      // the banks' floor → the bar (and the cloud) (px @ design)
+        ICON_FRAC: 3,       // the cloud's height, × HEIGHT
+        TRACK_COLOR:  '#5a3d1e',   // the empty part — the ground's brown, faint
+        TRACK_ALPHA:  0.3,
+        FILL_COLOR:   '#8aa0b4',   // storm grey, filling toward the cloud
+        BORDER_COLOR: '#ffffff',
+        BORDER_W:     3,           // px @ design; 0 for none
+        ICON_INK:     '#5a3d1e',   // the cloud's outline
+        ICON_DROP:    '#8aa0b4',   // its drops — the fill's colour, so the two read as one
+        // Under the fruit flying up to the banks (CROPS.DEPTH.PICKED = 6), so
+        // produce passes over the bar rather than behind it.
         DEPTH: 5,
+    },
+
+    // ── WHEN THE RAIN COMES ───────────────────────────────────────────────────
+    // The harvest stops, every bank still standing bursts and pays out — each
+    // the moment any fruit already on its way to it has landed — and a
+    // card takes the banks' place: the farm, how much of it was harvested, and
+    // a countdown. At the end of it the SAME field is sown again from nothing,
+    // the banks come back and the rain timer starts over.
+    //
+    // A bank pays its full labelled value whatever share was harvested — for
+    // now. What it should pay for a part-harvest is still to be decided.
+    RAIN_ROUND: {
+        COUNTDOWN:        4,      // seconds the card stands before the replant
+        // WHAT THE RAIN SPOILS: every plant still standing unpicked — and the
+        // fruit on it — goes grey as the rain starts. Stumps already harvested
+        // are left as they are.
+        GREY: {
+            TINT:  '#8f8f8f',
+            ALPHA: 0.72,          // never brightens a plant already dimmer
+            MS:    400,
+        },
+        CARD: {
+            NAME_FORMAT: '{crop} Farm',                 // {crop} = the crop's name
+            PCT_FORMAT:  '{p}% harvested',
+            NEXT_FORMAT: 'Next harvest begins in {s}',  // {s} = seconds left
+            NAME_SIZE:   34,      // px @ design scale
+            PCT_SIZE:    30,
+            NEXT_SIZE:   22,
+            LINE_GAP:    2,       // px @ design
+            COLOR:       '#ffffff',
+            STROKE:      '#5a3d1e',
+            STROKE_W:    5,
+            IN_MS:       260,
+            OUT_MS:      220,
+            // Over the rain (9), so it reads through it; under the pigs in the
+            // slots (10+).
+            DEPTH: 9.5,
+        },
     },
 };
 

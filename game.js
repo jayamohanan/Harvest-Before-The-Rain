@@ -172,13 +172,18 @@ class GameScene extends Phaser.Scene {
         this._leafScale        = 0;
 
         // ── The rain ─────────────────────────────────────────────────────
-        // Seconds until it comes, and whether it has. See CONFIG.RAIN_TIMER.
-        this.rainIn            = (CONFIG.RAIN_TIMER || {}).SECONDS || 15;
+        // How far the clock has run toward it (ms), and whether it has come.
+        // See CONFIG.RAIN_TIMER.
+        this.rainElapsed       = 0;
         this.raining           = false;
         this.rainEmitter       = null;
         this.rainMask          = null;
-        this.rainTimer         = null;   // the stopwatch and its figure
-        this.rainClock         = null;   // the 1s countdown event
+        this.rainTimer         = null;   // the bar and its cloud
+        this.rainBarAt         = null;   // …where it goes (createSlots)
+        this.rainCard          = null;   // farm / % harvested / next harvest in…
+        this.rainCardLeft      = null;   // …its seconds left; null while not up
+        this.rainCardClock     = null;
+        this._rainReplanting   = false;  // the field being cleared and resown
 
         // Layout state for responsive design
         this.isPortrait         = true;  // Detected in create()
@@ -550,6 +555,7 @@ class GameScene extends Phaser.Scene {
         const hadMergeHint = !!this.mergePointer;
         const hadSlotHints = !!this.slotHints;
         const kept = (this.crops || []).map((c) => ({ left: c.left, done: c.done, shakeDir: c.shakeDir }));
+        if (this.rainCard) { this.tweens.killTweensOf(this.rainCard); this.rainCard.destroy(); this.rainCard = null; }
 
         // ── The old layout's furniture comes down ────────────────────────────
         const gone = (o) => { if (o && o.scene) { this.tweens.killTweensOf(o); o.destroy(); } };
@@ -629,7 +635,19 @@ class GameScene extends Phaser.Scene {
 
         this._buildSplitLine();
         this._buildRain();
+        // IN THE RAIN, every bank counts as gone. A burst mid-flight when the
+        // old layout came down never finishes on the new one, so rather than
+        // wait on it the field is settled as the rain would leave it: no banks,
+        // and the card up.
+        if (this.raining) {
+            for (const c of this.crops || []) { c.burst = c.burstDone = true; }
+            for (const pig of this.piggyBanks || []) if (pig) pig.setVisible(false);
+            for (const lbl of this.piggyLabels || []) if (lbl) lbl.setVisible(false);
+            this._greyRemaining(true);
+        }
         this._buildRainTimer();
+        if (this.rainCardLeft != null) this._buildRainCard(false);
+        else this._checkRainCard();
         if (hadOverlay)   this.createStartOverlay();
         if (hadMergeHint) this.createMergeTutorial();
         if (hadSlotHints) this._showSlotHint();
@@ -836,10 +854,7 @@ class GameScene extends Phaser.Scene {
         this._buildPauseKey();
         this._buildSplitLine();
         this._buildRain();
-        this._buildRainTimer();
-        this.rainClock = this.time.addEvent({
-            delay: 1000, callback: this._rainTick, callbackScope: this, loop: true,
-        });
+        this._resetRainTimer();
 
         // Everything the opening view needs is up.
         finishLoadingScreen();
@@ -1070,8 +1085,28 @@ class GameScene extends Phaser.Scene {
             top = lowest = B.y + B.height - lineGap - labelH
                          - s(P.CHARGE_RATE_GAP) - ssz - slotGap - head - box.h;
         }
-        if (pigOn) {
-            const floor = pigTop + pigH + pigGap;
+        // ── THE RAIN BAR ──────────────────────────────────────────────────
+        // Under the banks, across the half — see CONFIG.RAIN_TIMER. Placed
+        // here, with the banks, because the plot and the farm's name both have
+        // to keep clear of it. x1 is the bar's right end, where the cloud is
+        // centred, so the cloud's own right edge keeps SIDE_PAD off the edge.
+        const RT = CONFIG.RAIN_TIMER || {};
+        let furnitureBottom = pigOn ? pigTop + pigH : B.y;
+        this.rainBarAt = null;
+        if (RT.ENABLED !== false) {
+            const bh   = (RT.HEIGHT !== undefined ? RT.HEIGHT : 16) * L.scale;
+            const ih   = bh * (RT.ICON_FRAC !== undefined ? RT.ICON_FRAC : 3);
+            const src  = this.textures.get(this._rainIconTexture()).getSourceImage();
+            const iw   = ih * src.width / src.height;
+            const side = (RT.SIDE_PAD !== undefined ? RT.SIDE_PAD : 28) * L.scale;
+            const band = Math.max(bh, ih);
+            const cy   = furnitureBottom + (RT.GAP !== undefined ? RT.GAP : 10) * L.scale + band / 2;
+            this.rainBarAt = { x0: B.x + side, x1: B.x + B.width - side - iw / 2, cy, h: bh, iconH: ih };
+            furnitureBottom = cy + band / 2;
+        }
+
+        if (pigOn || this.rainBarAt) {
+            const floor = furnitureBottom + pigGap;
             top = Math.min(Math.max(top, floor), lowest);
         }
 
@@ -1082,7 +1117,7 @@ class GameScene extends Phaser.Scene {
         const FI = CONFIG.FARM_INFO || {};
         this.farmInfoAt = {
             x:      B.x + (FI.LEFT_PAD !== undefined ? FI.LEFT_PAD : 28) * L.scale,
-            top:    pigOn ? pigTop + pigH : B.y,
+            top:    furnitureBottom,   // under the banks and the rain bar
             bottom: top,
         };
 
@@ -1353,6 +1388,14 @@ class GameScene extends Phaser.Scene {
         });
     }
 
+    // A crop's display name: FARM_INFO.NAMES where it says, otherwise the file
+    // name title-cased — 'bell-pepper' → 'Bell Pepper'.
+    _cropTitle(name) {
+        const F = CONFIG.FARM_INFO || {};
+        return (F.NAMES || {})[name]
+            || String(name).split(/[-_ ]+/).map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+    }
+
     _farmInfoStyle(size, color) {
         return {
             fontSize: Math.max(10, Math.round(size * this.layoutConfig.scale)) + 'px',
@@ -1377,8 +1420,7 @@ class GameScene extends Phaser.Scene {
         const cs = this.farmHarvStyle = this._farmInfoStyle(F.AREA_SIZE || 24, F.AREA_COLOR || '#5b3a1c');
         const gap = (F.LINE_GAP !== undefined ? F.LINE_GAP : 0) * s;
 
-        const title = (F.NAMES || {})[name]
-            || name.split(/[-_ ]+/).map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+        const title = this._cropTitle(name);
         // The level's own number, so the run reads as a count of farms — the
         // crop list wraps, and "Tomato Farm" alone would repeat every 16 levels.
         // {total} is how many levels there are — one per row of CROP_VALUES.
@@ -2044,6 +2086,9 @@ class GameScene extends Phaser.Scene {
     // the bank (_bankFruit). `delay` holds it for its place in a chain.
     _liftFruit(fr, crop, h, last, delay) {
         const H = (CONFIG.CROPS || {}).PICK || {};
+        // ON ITS WAY TO THE BANK from this moment — counted off again as it
+        // lands (_bankFruit), so the rain knows what it must wait for.
+        crop.inFlight = (crop.inFlight || 0) + 1;
         this.tweens.add({
             targets: fr,
             y: fr.y - h * (H.RISE !== undefined ? H.RISE : 1),
@@ -2065,13 +2110,14 @@ class GameScene extends Phaser.Scene {
     // LAST fruit still has to cash its plant out and clear the way for the
     // level to turn over, bank or no bank.
     _bankFruit(fr, crop, last) {
-        if (!fr || !fr.scene) return;
+        if (!fr || !fr.scene) { this._fruitLanded(crop); return; }
         const row = crop.row;
         const PG  = (CONFIG.CROPS || {}).PIGGY || {};
         const pig = this.piggyBanks && this.piggyBanks[row];
         if (!pig || !pig.scene) {
             fr.destroy();
             if (last) this._explodePiggy(crop, () => this._cropFullyBanked(crop));
+            this._fruitLanded(crop);
             return;
         }
 
@@ -2097,6 +2143,7 @@ class GameScene extends Phaser.Scene {
                 // in its very first pick.
                 if (last) this._explodePiggy(crop, () => this._cropFullyBanked(crop));
                 else this._popPiggy(pig);
+                this._fruitLanded(crop);
             },
         });
     }
@@ -2325,7 +2372,7 @@ class GameScene extends Phaser.Scene {
 
     // RAIN OVER THE FARM HALF — see CONFIG.RAIN. Built against the layout, so a
     // relayout tears it down and builds it again. Parked until the rain timer
-    // runs out (see _rainTick); once it has, it falls for good.
+    // runs out (see _rainStep); once it has, it falls for good.
     //
     // CLIPPED BY A MASK, not killed at the edge. A slanted drop spends part of
     // its fall outside the farm's rectangle — it starts upwind of it — so
@@ -2388,112 +2435,321 @@ class GameScene extends Phaser.Scene {
         if (this.gamePaused) this.rainEmitter.pause();
     }
 
-    // ── The rain timer ───────────────────────────────────────────────────────
-    // A stopwatch, baked once: white face, brown rim, the crown and side button
-    // on top, one hand. Minimal enough to sit beside a figure without competing
-    // with it — see CONFIG.RAIN_TIMER.
-    _timerIconTexture() {
-        const key = 'rain_timer_icon';
+    // ── The rain bar ─────────────────────────────────────────────────────────
+    // A rain cloud, baked once: white puffs over a brown outline, three drops
+    // falling out of it. Drawn in code — see CONFIG.RAIN_TIMER.
+    _rainIconTexture() {
+        const key = 'rain_bar_icon';
         if (this.textures.exists(key)) return key;
-        const w = 64, h = 72;
+        const T = CONFIG.RAIN_TIMER || {};
+        const w = 96, h = 84;
         const canvas = this.textures.createCanvas(key, w, h);
         const ctx = canvas.getContext();
-        const ink = (CONFIG.RAIN_TIMER || {}).STROKE || '#5a3d1e';
-        const cx = w / 2, cy = 42, r = 25;
+        const ink = T.ICON_INK || '#5a3d1e';
         ctx.clearRect(0, 0, w, h);
-        ctx.fillStyle = ink;
-        // The crown and its stem, then the side button, tilted off the rim.
-        ctx.fillRect(cx - 9, 2, 18, 7);
-        ctx.fillRect(cx - 4, 8, 8, 8);
-        ctx.save();
-        ctx.translate(cx, cy);
-        ctx.rotate(Math.PI / 4);
-        ctx.fillRect(-4, -r - 9, 8, 9);
-        ctx.restore();
-        // The face.
-        ctx.beginPath();
-        ctx.arc(cx, cy, r, 0, Math.PI * 2);
-        ctx.fillStyle = '#ffffff';
-        ctx.fill();
-        ctx.lineWidth = 5;
+
+        // THE DROPS: a point at the top, round at the bottom.
+        ctx.fillStyle = T.ICON_DROP || '#8aa0b4';
         ctx.strokeStyle = ink;
-        ctx.stroke();
-        // One hand, pointing up and a little right, and its pin.
-        ctx.lineCap = 'round';
-        ctx.lineWidth = 4;
-        ctx.beginPath();
-        ctx.moveTo(cx, cy);
-        ctx.lineTo(cx + 8, cy - 15);
-        ctx.stroke();
-        ctx.beginPath();
-        ctx.arc(cx, cy, 3.5, 0, Math.PI * 2);
-        ctx.fillStyle = ink;
-        ctx.fill();
+        ctx.lineWidth = 3;
+        for (const [x, y] of [[32, 70], [50, 74], [68, 70]]) {
+            ctx.beginPath();
+            ctx.moveTo(x, y - 9);
+            ctx.lineTo(x + 5, y + 1);
+            ctx.arc(x, y + 1, 5, 0, Math.PI);
+            ctx.closePath();
+            ctx.fill();
+            ctx.stroke();
+        }
+
+        // THE CLOUD: each puff laid down a little larger in the ink, then all
+        // of them again in white — so only the OUTSIDE of the union is
+        // outlined, never the seams between puffs.
+        const puffs = [[28, 42, 15], [48, 32, 21], [70, 40, 17], [40, 48, 12], [60, 48, 12]];
+        for (const [fill, grow] of [[ink, 3], ['#ffffff', 0]]) {
+            ctx.fillStyle = fill;
+            for (const [x, y, r] of puffs) {
+                ctx.beginPath();
+                ctx.arc(x, y, r + grow, 0, Math.PI * 2);
+                ctx.fill();
+            }
+        }
         canvas.refresh();
         return key;
     }
 
-    // The stopwatch and the seconds left, centred under the middle bank.
-    // Built against the layout (the banks' floor), so a relayout rebuilds it
-    // from this.rainIn, which is the only state it has.
+    _rainTotalMs() {
+        return ((CONFIG.RAIN_TIMER || {}).SECONDS || 15) * 1000;
+    }
+
+    // THE BAR, where createSlots put it (rainBarAt): the empty track, the fill
+    // over it, the border over that, and the cloud on the right end. Built
+    // against the layout, so a relayout rebuilds it from rainElapsed, which is
+    // the only state it has.
     _buildRainTimer() {
         if (this.rainTimer) { this.rainTimer.destroy(); this.rainTimer = null; }
-        const T = CONFIG.RAIN_TIMER || {};
-        if (T.ENABLED === false) return;
-        const L  = this.layoutConfig;
-        const s  = L.scale;
-        const fs = Math.max(12, Math.round((T.SIZE !== undefined ? T.SIZE : 34) * s));
-        const gap = (T.GAP !== undefined ? T.GAP : 8) * s;
-        const mid = this.piggyBanks && this.piggyBanks[1];
-        const x   = mid ? mid.x : (this.farmRows ? this.farmRows[1].cx : L.partB.x + L.partB.width / 2);
-        const top = (this.pigRow ? this.pigRow.bottom : L.partB.y) + gap;
+        const T  = CONFIG.RAIN_TIMER || {};
+        const at = this.rainBarAt;
+        if (T.ENABLED === false || !at) return;
+        const s  = this.layoutConfig.scale;
+        const w  = at.x1 - at.x0, r = at.h / 2, y = at.cy - r;
 
-        const style = {
-            fontSize: fs + 'px', fontFamily: CONFIG.FONT_FAMILY, fontStyle: CONFIG.FONT_WEIGHT,
-            color: T.COLOR || '#ffffff',
-            stroke: T.STROKE || '#5a3d1e',
-            strokeThickness: Math.max(1, Math.round((T.STROKE_W !== undefined ? T.STROKE_W : 5) * s)),
-        };
-        const text = this.add.text(0, 0, this._rainTimerText(), style).setOrigin(0, 0.5);
-        const key  = this._timerIconTexture();
-        const src  = this.textures.get(key).getSourceImage();
-        const ih   = fs * (T.ICON_FRAC !== undefined ? T.ICON_FRAC : 1.15);
-        const iw   = ih * src.width / src.height;
-        const icon = this.add.image(0, 0, key).setDisplaySize(iw, ih).setOrigin(0, 0.5);
-        // Laid out left to right, then the pair shifted so its middle is on x.
-        // Sized off the widest figure it will show, so the stopwatch does not
-        // step sideways as the digits change.
-        const ig  = (T.ICON_GAP !== undefined ? T.ICON_GAP : 6) * s;
-        const probe = this.add.text(0, 0, this._rainTimerText(Math.max(this.rainIn, T.SECONDS || 15)), style).setVisible(false);
-        const tw = Math.max(text.width, probe.width);
-        probe.destroy();
-        const x0 = -(iw + ig + tw) / 2;
-        icon.x = x0;
-        text.x = x0 + iw + ig;
-        const h = Math.max(ih, text.height);
-        this.rainTimer = this.add.container(x, top + h / 2, [icon, text])
-            .setDepth(T.DEPTH !== undefined ? T.DEPTH : 5);
-        this.rainTimer.text = text;
-    }
-
-    // m:ss — "0:15" down to "0:00".
-    _rainTimerText(sec) {
-        const v = Math.max(0, Math.ceil(sec !== undefined ? sec : this.rainIn));
-        return `${Math.floor(v / 60)}:${String(v % 60).padStart(2, '0')}`;
-    }
-
-    // ONE SECOND OFF, on the scene's clock — so the dev pause stops it along
-    // with the harvest tick. At nought the rain starts and the clock stops.
-    _rainTick() {
-        if (this.raining) return;
-        this.rainIn = Math.max(0, this.rainIn - 1);
-        if (this.rainTimer && this.rainTimer.text.scene) {
-            this.rainTimer.text.setText(this._rainTimerText());
+        const track = this.add.graphics();
+        track.fillStyle(hexColor(T.TRACK_COLOR || '#5a3d1e'), T.TRACK_ALPHA !== undefined ? T.TRACK_ALPHA : 0.3);
+        track.fillRoundedRect(at.x0, y, w, at.h, r);
+        const fill = this.add.graphics();
+        const border = this.add.graphics();
+        const bw = (T.BORDER_W !== undefined ? T.BORDER_W : 3) * s;
+        if (bw > 0) {
+            border.lineStyle(bw, hexColor(T.BORDER_COLOR || '#ffffff'), 1);
+            border.strokeRoundedRect(at.x0, y, w, at.h, r);
         }
-        if (this.rainIn > 0) return;
+        const key  = this._rainIconTexture();
+        const src  = this.textures.get(key).getSourceImage();
+        const icon = this.add.image(at.x1, at.cy, key)
+            .setDisplaySize(at.iconH * src.width / src.height, at.iconH);
+
+        this.rainTimer = this.add.container(0, 0, [track, fill, border, icon])
+            .setDepth(T.DEPTH !== undefined ? T.DEPTH : 5)
+            .setVisible(this.rainCardLeft == null);   // the rain card stands in its place
+        this.rainTimer.fill = fill;
+        this.rainTimer.drawnW = -1;
+        this._drawRainBar();
+    }
+
+    // The fill, redrawn only when it has grown by a whole pixel — which over a
+    // 15s bar is most frames, and costs one rounded rectangle when it is.
+    _drawRainBar() {
+        const bar = this.rainTimer;
+        const at  = this.rainBarAt;
+        if (!bar || !bar.fill.scene || !at) return;
+        const T = CONFIG.RAIN_TIMER || {};
+        const p = this.raining ? 1 : Phaser.Math.Clamp(this.rainElapsed / this._rainTotalMs(), 0, 1);
+        const w = Math.round((at.x1 - at.x0) * p);
+        if (w === bar.drawnW) return;
+        bar.drawnW = w;
+        const g = bar.fill.clear();
+        if (w <= 0) return;
+        g.fillStyle(hexColor(T.FILL_COLOR || '#8aa0b4'), 1);
+        g.fillRoundedRect(at.x0, at.cy - at.h / 2, w, at.h, Math.min(at.h / 2, w / 2));
+    }
+
+    // ONE FRAME'S WORTH OFF THE CLOCK, from update() — so the dev pause, which
+    // stops update, stops it too. When it is full the rain comes (_startRain).
+    //
+    // HELD WHILE THE FIELD IS FINISHED. Once every plant is spent the level is
+    // on its way to turning over, and rain landing in that gap would fight the
+    // turn for the field. The new level starts a full clock (_resetRainTimer).
+    _rainStep(delta) {
+        if (this.raining || this._levelTurning) return;
+        const crops = this.crops || [];
+        if (!crops.length || crops.every((c) => c.done)) return;
+        const total = this._rainTotalMs();
+        this.rainElapsed = Math.min(total, this.rainElapsed + delta);
+        this._drawRainBar();
+        if (this.rainElapsed >= total) this._startRain();
+    }
+
+    // The clock back to empty — a new field, or the same one replanted after
+    // the rain.
+    _resetRainTimer() {
+        this.rainElapsed = 0;
+        this._buildRainTimer();
+    }
+
+    // ── The rain comes ───────────────────────────────────────────────────────
+    // The harvest stops where it is (chargeCycle) and every bank still standing
+    // bursts — each as soon as any fruit on its way to it has landed. A plant
+    // already stripped, its last fruit still in the air, bursts its own bank
+    // when that fruit lands, as it always did. The card waits for every bank
+    // either way (_checkRainCard).
+    _startRain() {
         this.raining = true;
-        if (this.rainClock) { this.rainClock.remove(false); this.rainClock = null; }
+        this.rainCardLeft = null;
+        this._drawRainBar();   // full
         if (this.rainEmitter) this.rainEmitter.start();
+        this._greyRemaining(false);
+
+        // EACH BANK GOES AS SOON AS NOTHING IS STILL ON ITS WAY TO IT: now, or
+        // the moment the last fruit already in the air lands (_fruitLanded).
+        for (const crop of this.crops || []) {
+            if (crop.done || crop.burst) continue;
+            if (crop.inFlight > 0) crop.burstOnLand = true;
+            // No onComplete: nothing waits on the coins landing. The card
+            // hangs off the banks going, not off the counter.
+            else this._explodePiggy(crop, null);
+        }
+        this._checkRainCard();
+    }
+
+    // ── What the rain spoils ─────────────────────────────────────────────────
+    // Every plant still standing unpicked on a plot the rain caught — the one
+    // being worked, its fruit, and the row waiting behind it — goes grey. A
+    // finished plot is left alone, and so are stumps: those were harvested.
+    //
+    // Tint rides a proxy, since it is not a tweenable property, and nothing
+    // else's tweens are killed: a fruit still swelling in keeps swelling, grey.
+    // `instant` for a relayout mid-rain, which rebuilds the plants in colour.
+    _greyRemaining(instant) {
+        const G  = (CONFIG.RAIN_ROUND || {}).GREY || {};
+        const to = hexColor(G.TINT !== undefined ? G.TINT : '#8f8f8f');
+        const a1 = G.ALPHA !== undefined ? G.ALPHA : 0.72;
+        const objs = [];
+        for (const crop of this.crops || []) {
+            if (crop.done) continue;
+            // Nothing grows back in the rain.
+            if (crop.regrow) { crop.regrow.remove(false); crop.regrow = null; }
+            const waiting = (crop.plants || []).slice((crop.active || 0) + 1);
+            for (const o of new Set([crop.plant, crop.fruit, ...waiting.flatMap((p) => [p.plant, p.fruit])])) {
+                if (o && o.scene) objs.push({ o, a0: o.alpha, a: Math.min(o.alpha, a1) });
+            }
+        }
+        const paint = (v) => {
+            for (const { o, a0, a } of objs) {
+                if (!o.scene) continue;
+                o.setTint(this._lerpColor(0xffffff, to, v));
+                o.setAlpha(a0 + (a - a0) * v);
+            }
+        };
+        if (instant) { paint(1); return; }
+        const step = { v: 0 };
+        this.tweens.add({ targets: step, v: 1, duration: G.MS !== undefined ? G.MS : 400,
+            ease: 'Sine.easeOut', onUpdate: () => paint(step.v) });
+    }
+
+    // A fruit has reached its bank. The last one in the air, on a plant the
+    // rain is waiting on, sets that bank off. Not if a relayout has rebuilt the
+    // field since: this plant is gone, and the relayout settled its bank.
+    _fruitLanded(crop) {
+        crop.inFlight = Math.max(0, (crop.inFlight || 0) - 1);
+        if (crop.inFlight > 0 || !crop.burstOnLand) return;
+        crop.burstOnLand = false;
+        if (this.raining && (this.crops || []).includes(crop)) this._explodePiggy(crop, null);
+    }
+
+    // A bank has burst and gone — from _explodePiggy, every way out of it.
+    _piggyGone(crop) {
+        crop.burstDone = true;
+        if (this.raining) this._checkRainCard();
+    }
+
+    // THE CARD GOES UP once the last bank on the field has gone, and not
+    // before: it stands where they stood.
+    _checkRainCard() {
+        if (!this.raining || this.rainCardLeft != null || this._rainReplanting) return;
+        const crops = this.crops || [];
+        if (!crops.every((c) => c.burstDone)) return;
+        const RR = CONFIG.RAIN_ROUND || {};
+        this.rainCardLeft = RR.COUNTDOWN !== undefined ? RR.COUNTDOWN : 4;
+        this._buildRainCard(true);
+        this.rainCardClock = this.time.addEvent({
+            delay: 1000, loop: true, callback: () => {
+                this.rainCardLeft--;
+                if (this.rainCardLeft > 0) {
+                    if (this.rainCard && this.rainCard.nextT.scene) {
+                        this.rainCard.nextT.setText(this._rainCardNext());
+                    }
+                    return;
+                }
+                this.rainCardClock.remove(false);
+                this.rainCardClock = null;
+                this._replantAfterRain();
+            },
+        });
+    }
+
+    // What share of the field was picked before the rain, whole percent,
+    // rounded DOWN — a field with anything left on it never reads 100%.
+    _harvestedPct() {
+        let got = 0, all = 0;
+        for (const c of this.crops || []) {
+            all += c.total || 0;
+            got += Math.max(0, (c.total || 0) - (c.left || 0));
+        }
+        return all > 0 ? Math.floor(100 * got / all) : 0;
+    }
+
+    _rainCardNext() {
+        const C = (CONFIG.RAIN_ROUND || {}).CARD || {};
+        return (C.NEXT_FORMAT || 'Next harvest begins in {s}').replace('{s}', Math.max(0, this.rainCardLeft));
+    }
+
+    // THE CARD: farm, share harvested, countdown — three centred lines where
+    // the banks stood, their labels included. Built against the layout, so a
+    // relayout rebuilds it from rainCardLeft; `fadeIn` only the first time.
+    _buildRainCard(fadeIn) {
+        if (this.rainCard) { this.tweens.killTweensOf(this.rainCard); this.rainCard.destroy(); this.rainCard = null; }
+        if (this.rainTimer) this.rainTimer.setVisible(false);
+        const C = (CONFIG.RAIN_ROUND || {}).CARD || {};
+        const L = this.layoutConfig;
+        const s = L.scale;
+        const style = (size) => ({
+            fontSize: Math.max(10, Math.round(size * s)) + 'px',
+            fontFamily: CONFIG.FONT_FAMILY, fontStyle: CONFIG.FONT_WEIGHT,
+            color: C.COLOR || '#ffffff',
+            stroke: C.STROKE || '#5a3d1e',
+            strokeThickness: Math.max(1, Math.round((C.STROKE_W !== undefined ? C.STROKE_W : 5) * s)),
+            align: 'center',
+        });
+        const name  = this._cropForLevel(this.cropLevel);
+        const nameT = this.add.text(0, 0, (C.NAME_FORMAT || '{crop} Farm')
+            .replace('{crop}', name ? this._cropTitle(name) : ''), style(C.NAME_SIZE || 34)).setOrigin(0.5, 0);
+        const pctT  = this.add.text(0, 0, (C.PCT_FORMAT || '{p}% harvested')
+            .replace('{p}', this._harvestedPct()), style(C.PCT_SIZE || 30)).setOrigin(0.5, 0);
+        const nextT = this.add.text(0, 0, this._rainCardNext(), style(C.NEXT_SIZE || 22)).setOrigin(0.5, 0);
+        const gap = (C.LINE_GAP !== undefined ? C.LINE_GAP : 2) * s;
+        pctT.y  = nameT.height + gap;
+        nextT.y = pctT.y + pctT.height + gap;
+        const h = nextT.y + nextT.height;
+        for (const t of [nameT, pctT, nextT]) t.y -= h / 2;
+
+        // WHERE THE BANKS STOOD: centred on the middle one's column, and
+        // between the top of its payout label and the floor the banks stand on.
+        const mid = this.piggyBanks && this.piggyBanks[1];
+        const lbl = this.piggyLabels && this.piggyLabels[1];
+        const x   = mid ? mid.x : L.partB.x + L.partB.width / 2;
+        const bottom = this.pigRow ? this.pigRow.bottom : L.partB.y + h;
+        const top    = lbl ? lbl.y - (this.pigRow ? this.pigRow.lblH : 0) / 2
+                     : (mid ? mid.y - mid.displayHeight / 2 : L.partB.y);
+        const cy = Math.max(L.partB.y + h / 2, (top + bottom) / 2);
+
+        const card = this.rainCard = this.add.container(x, cy, [nameT, pctT, nextT])
+            .setDepth(C.DEPTH !== undefined ? C.DEPTH : 9.5);
+        card.nextT = nextT;
+        if (fadeIn) {
+            card.setAlpha(0).setScale(0.85);
+            this.tweens.add({ targets: card, alpha: 1, scale: 1,
+                duration: C.IN_MS !== undefined ? C.IN_MS : 260, ease: 'Back.easeOut' });
+        }
+    }
+
+    // THE SAME FIELD, SOWN AGAIN. Everything the last attempt picked is gone
+    // with it — the new plants hold their full figures — and the banks, the
+    // clock and a dry sky come back with them.
+    _replantAfterRain() {
+        const C = (CONFIG.RAIN_ROUND || {}).CARD || {};
+        this._rainReplanting = true;
+        const card = this.rainCard;
+        this.rainCard = null;
+        if (card) {
+            this.tweens.killTweensOf(card);
+            this.tweens.add({ targets: card, alpha: 0, scale: 0.9,
+                duration: C.OUT_MS !== undefined ? C.OUT_MS : 220,
+                onComplete: () => card.destroy() });
+        }
+        // The rain stops falling; the drops in the air finish their fall.
+        if (this.rainEmitter) this.rainEmitter.stop();
+        // THE FARM'S BLOCK GOES TOO, so buildCrops puts up a fresh one at 0
+        // harvested instead of running the level-turn reel over a level that
+        // has not turned.
+        if (this.farmInfo) { this.tweens.killTweensOf(this.farmInfo); this.farmInfo.destroy(); this.farmInfo = null; }
+        this._clearCrops(() => {
+            this.raining = false;
+            this.rainCardLeft = null;
+            this._rainReplanting = false;
+            this.buildCrops(this.cropLevel, true);
+            this._resetRainTimer();
+        });
     }
 
     // A new plant coming up, BARE, from a fraction of full size to it. It is
@@ -2815,6 +3071,10 @@ class GameScene extends Phaser.Scene {
     // every coin it threw has reached the counter — never earlier, so a level
     // can never turn while the field still has an animation running on it.
     _cropFullyBanked(crop) {
+        // A plant finished just before the rain still pays out, but the round
+        // is the rain's to end now — it replants this same field (see
+        // _checkRainCard), so the level does not turn.
+        if (this.raining) return;
         if ((this.crops || []).every((c) => c.done)) this._advanceCropLevel();
     }
 
@@ -2890,8 +3150,13 @@ class GameScene extends Phaser.Scene {
     }
 
     _explodePiggy(crop, onComplete) {
+        // ONCE PER PLANT. The rain bursts every bank still standing, and a
+        // plant's last fruit landing would otherwise burst — and pay — its
+        // bank a second time.
+        if (crop.burst) return;
+        crop.burst = true;
         const PG = (CONFIG.CROPS || {}).PIGGY || {};
-        if (PG.ENABLED === false) { if (onComplete) onComplete(); return; }
+        if (PG.ENABLED === false) { this._piggyGone(crop); if (onComplete) onComplete(); return; }
         const amount = this._piggyPayout(crop);
 
         const pig = this.piggyBanks && this.piggyBanks[crop.row];
@@ -2899,13 +3164,13 @@ class GameScene extends Phaser.Scene {
         if (E.ENABLED === false || !pig || !pig.scene) {
             // No bank to burst — the coins this plant paid out are still
             // earned. Thrown from the plant's own spot rather than lost.
+            this._piggyGone(crop);
             this.animateCoinReward(crop.cx, crop.cy, amount, 0, null, onComplete);
             return;
         }
 
-        // ITS REST STATE, CAPTURED ONCE. Every squeeze and swell below is
-        // measured off this, never off whatever scale the last tween left it
-        // at, so a bank that goes off is always winding up from the same place.
+        // ITS REST STATE, CAPTURED ONCE. The burst is measured off this, never
+        // off whatever scale a pop left it at, so every bank goes off the same.
         if (pig.restScaleX === undefined) {
             pig.restScaleX = pig.scaleX;
             pig.restScaleY = pig.scaleY;
@@ -2916,44 +3181,8 @@ class GameScene extends Phaser.Scene {
         const ox = pig.x, oy = pig.y;
         pig.setScale(rx, ry).setPosition(ox, oy).setAlpha(1).setVisible(true);
 
-        const lo    = E.SQUEEZE !== undefined ? E.SQUEEZE : 0.90;
-        const hi    = E.SWELL   !== undefined ? E.SWELL   : 1.12;
-        const cycle = E.CYCLE_MS !== undefined ? E.CYCLE_MS : 110;
-        const winds = Math.max(0, E.WIND_UP !== undefined ? E.WIND_UP : 2);
-        const jit   = E.JITTER !== undefined ? E.JITTER : 3;
-
-        // THE TENSION, one squeeze-to-swell per cycle, TIGHTER EACH TIME: cycle
-        // i pulls the low and high a little further from rest than the last, so
-        // it reads as building rather than one pulse simply repeated. It
-        // trembles as it winds — a couple of px of jitter, flipped every cycle
-        // — because a thing under strain shakes, it does not glide.
-        const cycles = winds + 1;
-        const squeezeStep = (i) => {
-            if (!pig.scene) return;
-            const grow = (i + 1) / cycles;               // 0 < grow ≤ 1
-            const s0 = rx - (rx - rx * lo) * grow, s0y = ry - (ry - ry * lo) * grow;
-            const s1 = rx + (rx * hi - rx) * grow, s1y = ry + (ry * hi - ry) * grow;
-            const dx = (i % 2 === 0 ? -1 : 1) * jit;
-            this.tweens.add({
-                targets: pig,
-                scaleX: s0, scaleY: s0y, x: ox + dx,
-                duration: cycle, ease: 'Sine.easeIn',
-                onComplete: () => {
-                    if (!pig.scene) return;
-                    this.tweens.add({
-                        targets: pig,
-                        scaleX: s1, scaleY: s1y, x: ox - dx,
-                        duration: cycle, ease: 'Sine.easeOut',
-                        onComplete: () => {
-                            if (i + 1 < cycles) squeezeStep(i + 1);
-                            else burst();
-                        },
-                    });
-                },
-            });
-        };
-
-        // THE BURST. One fast lunge past SWELL, no fade — an explosion
+        // THE BURST, AT ONCE — no wind-up: it goes the moment what it was
+        // waiting on has landed. One fast lunge outward, no fade — an explosion
         // overshoots outward, it does not shrink to nothing — and then it is
         // simply gone at the end of the scale. Hidden, not destroyed: put back to rest here so it is
         // ready standing rather than needing a reset found later.
@@ -2970,6 +3199,7 @@ class GameScene extends Phaser.Scene {
                     if (pig.scene) pig.setVisible(false).setScale(rx, ry).setAlpha(1);
                     const lbl = this.piggyLabels && this.piggyLabels[crop.row];
                     if (lbl && lbl.scene) lbl.setVisible(false);
+                    this._piggyGone(crop);
                     this._woodChipBurst(ox, oy, pig.displayHeight, pig.depth);
                     // THE COINS. Scattered across the whole screen — the merge
                     // grid included — then swept to the counter; this is the
@@ -2980,7 +3210,7 @@ class GameScene extends Phaser.Scene {
             });
         };
 
-        squeezeStep(0);
+        burst();
     }
 
     // ── The bank's splinters ─────────────────────────────────────────────────
@@ -3057,6 +3287,8 @@ class GameScene extends Phaser.Scene {
                 this.cropLevel++;
                 this.buildCrops(undefined, true);
                 this._levelTurning = false;
+                // A new field, a full clock — see _resetRainTimer.
+                this._resetRainTimer();
             });
         });
     }
@@ -3483,6 +3715,9 @@ class GameScene extends Phaser.Scene {
         // HELD WHILE A RELAYOUT WAITS, so the field can come to rest — see
         // _requestRelayout. A second or so of harvest, never lost work.
         if (this._relayoutPending) return;
+        // NOTHING IS PICKED IN THE RAIN — what is still on the field when it
+        // comes is lost. See _startRain.
+        if (this.raining) return;
         for (let i = 0; i < 3; i++) {
             const slot = this.chargingSlots[i];
             if (!slot) continue;
@@ -4762,6 +4997,7 @@ class GameScene extends Phaser.Scene {
         } else {
             this._fastForward(false);   // turned back before it ran
         }
+        this._rainStep(delta);
         // Nothing to step. Everything that moves on screen is tween- or
         // timer-driven, and _setPaused stops those directly.
     }
